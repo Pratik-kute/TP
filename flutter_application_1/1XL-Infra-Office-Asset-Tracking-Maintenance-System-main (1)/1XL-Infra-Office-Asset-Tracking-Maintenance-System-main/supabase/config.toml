@@ -1,0 +1,11 @@
+# Supabase CLI project config — used for `supabase functions deploy / serve`.
+# This project predates the CLI; only Edge Functions config is wired here.
+
+project_id = "xdtrqkjztgjihtahmbjx"
+
+[functions.monthly-asset-report]
+# verify_jwt is off because this app uses its own users table for auth
+# (not Supabase Auth). The function verifies caller identity by looking up
+# the callerUserId from the request body against the users table.
+verify_jwt = false
+import_map = "./functions/monthly-asset-report/deno.json"

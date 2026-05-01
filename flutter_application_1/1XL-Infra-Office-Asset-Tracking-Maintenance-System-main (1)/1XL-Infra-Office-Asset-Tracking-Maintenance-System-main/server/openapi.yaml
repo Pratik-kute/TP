@@ -1,0 +1,763 @@
+openapi: 3.1.0
+info:
+  title: 1XL Asset Tracker — Mobile API
+  version: 1.0.0
+  description: |
+    REST API consumed by the Flutter companion app for the 1XL Asset Tracker
+    platform. Implements every P0 endpoint from `questionnaire.md` Section 5,
+    plus photo upload, recovery, audit verification, and reference lookups.
+
+    ### Auth model
+    All requests use the standard `Authorization: Bearer <token>` scheme.
+    The bearer token is one of:
+    - **API key** — `<orgslug>_<live|test>_<24chars>`, e.g. `1xl_live_K8j3pQrX9bR2sN7wHzVc1qLm`.
+      Issued by an org admin in the web UI.
+    - **Access JWT** — short-lived per-user token from `POST /auth/login`.
+    The server distinguishes them by shape. `/auth/login`, `/auth/refresh`,
+    `/auth/logout` only accept an API key. `/auth/me` only accepts a user JWT.
+    Everything else accepts either.
+
+    ### Versioning
+    Additive changes within `/api/v1/*`. Breaking changes get `/api/v2/*`.
+
+    ### Idempotency
+    All `POST` endpoints accept `Idempotency-Key`. Same key + same body = cached
+    response for 24h. Same key + different body = `409 CONFLICT`.
+
+servers:
+  - url: https://asset.thebizzfly.com
+    description: Production
+  - url: http://localhost:4000
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <token>` where `<token>` is either:
+          - an API key (`<orgslug>_<live|test>_<24chars>`) — for /auth/login/refresh/logout and server-to-server calls, or
+          - a user JWT (HS256) — for user-scoped calls (e.g. /auth/me).
+
+  parameters:
+    RequestId:
+      name: X-Request-Id
+      in: header
+      schema: { type: string, maxLength: 128 }
+      description: Optional client-supplied id mirrored back in the response and any error envelope.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string, minLength: 16, maxLength: 128 }
+      description: Required for safe POST retries. 24h TTL.
+    AssetId:
+      name: assetId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RepairId:
+      name: repairId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PhotoId:
+      name: photoId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - UNAUTHENTICATED
+                - TOKEN_EXPIRED
+                - INVALID_API_KEY
+                - FORBIDDEN
+                - INSUFFICIENT_SCOPE
+                - NOT_FOUND
+                - ASSET_NOT_FOUND
+                - REPAIR_NOT_FOUND
+                - PHOTO_NOT_FOUND
+                - CYCLE_NOT_FOUND
+                - INVALID_QR_PAYLOAD
+                - VALIDATION_FAILED
+                - CONFLICT
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+            message:    { type: string }
+            requestId:  { type: string }
+            fieldErrors:
+              type: array
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field:   { type: string }
+                  message: { type: string }
+            details: { }
+
+    User:
+      type: object
+      properties:
+        id:             { type: string, format: uuid }
+        name:           { type: string }
+        email:          { type: string, format: email }
+        role:           { type: string, enum: [admin, manager, employee, technician, vendor, auditor, staff] }
+        departmentId:   { type: string, nullable: true }
+        phone:          { type: string }
+        avatar:         { type: string, nullable: true }
+        organizationId: { type: string, format: uuid, nullable: true }
+        isActive:       { type: boolean }
+
+    Organization:
+      type: object
+      properties:
+        id:           { type: string, format: uuid }
+        name:         { type: string }
+        shortName:    { type: string }
+        logoUrl:      { type: string, nullable: true }
+        currency:     { type: string }
+        country:      { type: string, nullable: true }
+        contactEmail: { type: string }
+        contactPhone: { type: string }
+        industry:     { type: string }
+
+    Asset:
+      type: object
+      properties:
+        id:             { type: string, format: uuid }
+        assetTag:       { type: string }
+        name:           { type: string }
+        type:           { type: string, enum: [furniture, it_equipment, vehicle, electronics, office_equipment, hvac, infrastructure, other] }
+        category:       { type: string }
+        brand:          { type: string }
+        model:          { type: string }
+        serialNumber:   { type: string }
+        status:
+          type: string
+          enum: [available, allocated, in_use, under_maintenance, retired, disposed, dead]
+          description: |
+            **CANONICAL LIST (Section 4.3 reconciliation).** Mobile must adopt these
+            seven values exactly. The legacy 5-status mobile list (`assigned`,
+            `under_repair`, `lost`) maps as: `assigned`→`allocated`,
+            `under_repair`→`under_maintenance`, `lost`→`dead`.
+        description:    { type: string }
+        purchaseDate:   { type: string, format: date }
+        purchaseCost:   { type: number }
+        currency:       { type: string, nullable: true }
+        warrantyStart:  { type: string, format: date, nullable: true }
+        warrantyEnd:    { type: string, format: date, nullable: true }
+        imageUrl:       { type: string, nullable: true }
+        imageUrls:
+          type: array
+          items: { type: string }
+        organizationId: { type: string, format: uuid }
+        createdAt:      { type: string, format: date-time }
+        updatedAt:      { type: string, format: date-time }
+
+    AssetEnvelope:
+      type: object
+      required: [asset, permittedActions]
+      properties:
+        asset:           { $ref: '#/components/schemas/Asset' }
+        location:        { type: object, nullable: true }
+        department:      { type: object, nullable: true }
+        vendor:          { type: object, nullable: true }
+        currentAllocation: { type: object, nullable: true }
+        currentAssignee: { type: object, nullable: true }
+        auditContext:
+          type: object
+          nullable: true
+          properties:
+            cycleId:                { type: string, format: uuid }
+            cycleName:              { type: string }
+            cycleStartsAt:          { type: string, format: date-time }
+            cycleEndsAt:            { type: string, format: date-time, nullable: true }
+            expectedLocationId:     { type: string, nullable: true }
+            expectedAssigneeId:     { type: string, nullable: true }
+            currentVerification:
+              type: object
+              nullable: true
+              properties:
+                id:        { type: string, format: uuid }
+                result:    { type: string, enum: [verified, flagged] }
+                createdAt: { type: string, format: date-time }
+        permittedActions:
+          type: array
+          items:
+            type: string
+            enum: [add_photo, log_maintenance, raise_repair, update_repair, mark_recovery, verify_audit]
+
+    AuthTokens:
+      type: object
+      required: [accessToken, accessTokenExpiresIn, refreshToken, refreshTokenExpiresIn]
+      properties:
+        accessToken:           { type: string }
+        accessTokenExpiresIn:  { type: integer }
+        refreshToken:          { type: string }
+        refreshTokenExpiresIn: { type: integer }
+
+  responses:
+    Unauthorized:
+      description: Authentication failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Validation:
+      description: Request validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: Idempotency-key reuse with different body, or business rule conflict
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+paths:
+  /health:
+    get:
+      summary: Service health + min-app-version + maintenance banner
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  service: { type: string }
+                  env: { type: string }
+                  uptimeSeconds: { type: integer }
+                  db:
+                    type: object
+                    properties:
+                      ok: { type: boolean }
+                      latencyMs: { type: integer }
+                  minAppVersion:
+                    type: object
+                    properties:
+                      ios: { type: string }
+                      android: { type: string }
+                  maintenanceMessage: { type: string, nullable: true }
+
+  # ─── Auth ─────────────────────────────────────────────────────────────────
+  /api/v1/auth/login:
+    post:
+      summary: Exchange email + password for access + refresh tokens
+      security:
+        - bearerAuth: []
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:    { type: string, format: email }
+                password: { type: string, minLength: 1 }
+                deviceId: { type: string, nullable: true }
+      responses:
+        '200':
+          description: Tokens + user
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/AuthTokens'
+                  - type: object
+                    properties:
+                      user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/refresh:
+    post:
+      summary: Rotate refresh token; issue new access + refresh
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+                deviceId:     { type: string, nullable: true }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/logout:
+    post:
+      summary: Revoke a refresh token (single device or all)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+                allDevices:   { type: boolean }
+      responses:
+        '200':
+          description: OK (idempotent)
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean, const: true } } }
+
+  /api/v1/auth/me:
+    get:
+      summary: Current user + their organization
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:         { $ref: '#/components/schemas/User' }
+                  organization: { $ref: '#/components/schemas/Organization', nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ─── Assets ───────────────────────────────────────────────────────────────
+  /api/v1/assets/lookup-by-qr:
+    post:
+      summary: Resolve a scanned QR payload to an asset envelope
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [qrPayload]
+              properties:
+                qrPayload: { type: string, description: 'Asset id (UUID), asset tag, or scan/asset URL' }
+                geoLat:    { type: number, minimum: -90,  maximum: 90 }
+                geoLng:    { type: number, minimum: -180, maximum: 180 }
+      responses:
+        '200':
+          description: Asset envelope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetEnvelope' }
+        '400': { $ref: '#/components/responses/Validation' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/assets/{assetId}:
+    get:
+      summary: Fetch one asset (envelope shape)
+      parameters: [{ $ref: '#/components/parameters/AssetId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/assets/{assetId}/photos/upload-url:
+    post:
+      summary: Get a presigned PUT URL for a photo upload
+      parameters:
+        - { $ref: '#/components/parameters/AssetId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename, mimeType, sizeBytes]
+              properties:
+                filename:  { type: string, maxLength: 200 }
+                mimeType:  { type: string, pattern: '^image/(jpe?g|png|webp|heic|heif)$' }
+                sizeBytes: { type: integer }
+                caption:   { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Presigned URL + photo id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  photoId:           { type: string, format: uuid }
+                  uploadUrl:         { type: string }
+                  uploadMethod:      { type: string, const: PUT }
+                  uploadHeaders:     { type: object, additionalProperties: { type: string } }
+                  storagePath:       { type: string }
+                  bucket:            { type: string }
+                  expiresInSeconds:  { type: integer }
+                  maxSizeBytes:      { type: integer }
+
+  /api/v1/assets/{assetId}/photos/{photoId}/finalize:
+    post:
+      summary: Confirm a photo upload and attach it to the asset
+      parameters:
+        - { $ref: '#/components/parameters/AssetId' }
+        - { $ref: '#/components/parameters/PhotoId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                caption: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Photo finalized and attached
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  photo:
+                    type: object
+                    properties:
+                      id:          { type: string, format: uuid }
+                      url:         { type: string }
+                      caption:     { type: string, nullable: true }
+                      mimeType:    { type: string }
+                      sizeBytes:   { type: integer }
+                      createdAt:   { type: string, format: date-time }
+                      finalizedAt: { type: string, format: date-time }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ─── Maintenance ──────────────────────────────────────────────────────────
+  /api/v1/assets/{assetId}/maintenance:
+    get:
+      summary: List maintenance entries for an asset
+      parameters: [{ $ref: '#/components/parameters/AssetId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+                  total: { type: integer }
+    post:
+      summary: Log a maintenance entry
+      parameters:
+        - { $ref: '#/components/parameters/AssetId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [taskTypeId, type]
+              properties:
+                taskTypeId:    { type: string }
+                type:          { type: string, enum: [preventive, corrective] }
+                scheduledDate: { type: string, format: date-time }
+                completedDate: { type: string, format: date-time }
+                technicianId:  { type: string, format: uuid, nullable: true }
+                cost:          { type: number, minimum: 0 }
+                notes:         { type: string }
+                checklist:     { type: array, items: { type: string } }
+                status:        { type: string, enum: [scheduled, in_progress, completed, overdue, cancelled] }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  maintenance: { type: object }
+
+  /api/v1/maintenance/task-types:
+    get:
+      summary: List task types for the maintenance composer
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:          { type: string }
+                        label:       { type: string }
+                        defaultType: { type: string, enum: [preventive, corrective] }
+
+  # ─── Repairs ──────────────────────────────────────────────────────────────
+  /api/v1/assets/{assetId}/repairs:
+    get:
+      summary: List repair tickets for an asset
+      parameters: [{ $ref: '#/components/parameters/AssetId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+                  total: { type: integer }
+    post:
+      summary: Raise a repair ticket
+      parameters:
+        - { $ref: '#/components/parameters/AssetId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issue]
+              properties:
+                issue:        { type: string, minLength: 3 }
+                priority:     { type: string, enum: [low, medium, high, critical] }
+                vendorId:     { type: string, format: uuid, nullable: true }
+                technicianId: { type: string, format: uuid, nullable: true }
+                partsUsed:    { type: string }
+                notes:        { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repair: { type: object }
+
+  /api/v1/repairs/{repairId}:
+    get:
+      summary: Full repair ticket with vendor + update history
+      parameters: [{ $ref: '#/components/parameters/RepairId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repair:  { type: object }
+                  vendor:  { type: object, nullable: true }
+                  updates: { type: array, items: { type: object } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/repairs/{repairId}/updates:
+    post:
+      summary: Append an update to a repair ticket (status transition + note)
+      parameters:
+        - { $ref: '#/components/parameters/RepairId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [note]
+              properties:
+                statusTo:   { type: string, enum: [pending, assigned, in_progress, completed, cancelled] }
+                note:       { type: string, minLength: 1 }
+                partsUsed:  { type: string }
+                laborHours: { type: number, minimum: 0 }
+                cost:       { type: number, minimum: 0 }
+      responses:
+        '201':
+          description: Update appended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  update: { type: object }
+
+  # ─── Recovery (atomic per TRD 5.16) ───────────────────────────────────────
+  /api/v1/assets/{assetId}/recovery:
+    post:
+      summary: File a loss/damage/theft incident, optionally marking the asset dead atomically
+      parameters:
+        - { $ref: '#/components/parameters/AssetId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [incidentType, description]
+              properties:
+                incidentType:  { type: string, enum: [lost, damaged, stolen, insurance_claim, write_off] }
+                severity:      { type: string, enum: [low, medium, high, critical] }
+                description:   { type: string, minLength: 3 }
+                estimatedLoss: { type: number, minimum: 0 }
+                incidentDate:  { type: string, format: date-time }
+                markAssetDead: { type: boolean, description: 'When true, also flips the asset to status=dead. Atomic — recovery is rolled back on failure.' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recovery: { type: object }
+                  asset:    { type: object, nullable: true, description: 'Updated asset row when markAssetDead was true.' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ─── Audit ────────────────────────────────────────────────────────────────
+  /api/v1/assets/{assetId}/audit/verify:
+    post:
+      summary: Verify an asset matches its expected location/assignee in the active cycle
+      parameters:
+        - { $ref: '#/components/parameters/AssetId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cycleId:           { type: string, format: uuid, description: 'Defaults to the active cycle' }
+                actualLocationId:  { type: string, format: uuid, nullable: true }
+                actualAssigneeId:  { type: string, format: uuid, nullable: true }
+                notes:             { type: string }
+                geoLat:            { type: number }
+                geoLng:            { type: number }
+      responses:
+        '201':
+          description: Verification recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verification: { type: object }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/assets/{assetId}/audit/flag:
+    post:
+      summary: Flag a discrepancy in the active audit cycle
+      parameters:
+        - { $ref: '#/components/parameters/AssetId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [flagReason, notes]
+              properties:
+                cycleId:           { type: string, format: uuid }
+                flagReason:        { type: string, enum: [wrong_location, wrong_assignee, damaged, missing, other] }
+                actualLocationId:  { type: string, format: uuid, nullable: true }
+                actualAssigneeId:  { type: string, format: uuid, nullable: true }
+                notes:             { type: string, minLength: 3 }
+                geoLat:            { type: number }
+                geoLng:            { type: number }
+      responses:
+        '201':
+          description: Flag recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verification: { type: object }
+
+  # ─── Reference data ───────────────────────────────────────────────────────
+  /api/v1/reference/users:
+    get:
+      summary: Picker list of users in the caller's org
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/User' }
+                  total: { type: integer }
+
+  /api/v1/reference/locations:
+    get:
+      summary: Picker list of locations in the caller's org
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { type: object }
+                  total: { type: integer }

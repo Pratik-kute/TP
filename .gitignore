@@ -1,0 +1,24 @@
+# Backend
+backend/node_modules/
+backend/.env
+backend/scratch/
+
+# Flutter
+flutter_application_1/asset_scanner_app/build/
+flutter_application_1/asset_scanner_app/.dart_tool/
+flutter_application_1/asset_scanner_app/.flutter-plugins
+flutter_application_1/asset_scanner_app/.flutter-plugins-dependencies
+flutter_application_1/asset_scanner_app/.pub-cache/
+flutter_application_1/asset_scanner_app/.packages
+flutter_application_1/asset_scanner_app/pubspec.lock
+
+# Screenshots & Misc
+*.png
+*.jpg
+*.jpeg
+*.zip
+backend_tree.txt
+tmp_appdata/
+design_pack/
+Asset_Tracker_APP/
+All documents/
